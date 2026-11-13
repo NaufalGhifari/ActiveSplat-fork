@@ -199,3 +199,20 @@ If you find our code/work useful in your research, please consider citing the fo
     publisher={IEEE}
 }
 ```
+
+---
+# Naufal Ghifari's Fork Additions
+
+# Raw Replica Scene
+For the map to be oriented correctly, you may have to apply a transformation operation such as this:
+
+```
+python3 -c "
+import trimesh, numpy as np
+T = np.array([[1,0,0,0],[0,0,1,0],[0,-1,0,0],[0,0,0,1]])
+m = trimesh.load('/datasets/replica/room_0/stage.ply', process=False)
+m.apply_transform(T)
+m.export('/datasets/replica/room_0/stage_habitat.ply')"
+```
+
+Also copy /datasets/replica/room_0/mesh.navmesh to /datasets/replica/room_0/stage_habitat.navmesh so Habitat-Sim automatically loads the navmesh for stage_habitat.ply.

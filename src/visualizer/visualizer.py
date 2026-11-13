@@ -469,6 +469,8 @@ class Visualizer:
         
         self.__set_planner_state_service = rospy.ServiceProxy('set_planner_state', SetPlannerState)
         rospy.wait_for_service('set_planner_state')
+        if self.__local_dataset is not None:
+            self.__cmd_vel_sub = rospy.Subscriber('cmd_vel', Twist, self.__cmd_vel_callback, queue_size=1)
         rospy.Subscriber('update_voronoi_graph_vis', Bool, self.__update_voronoi_graph_trigger_callback, queue_size=1)
         rospy.Subscriber('update_high_connectivity_nodes_vis', Bool, self.__update_high_connectivity_nodes_trigger_callback, queue_size=1)
         rospy.Subscriber('update_global_visibility_map_vis', Int32, self.__update_global_visibility_map_callback, queue_size=1)
@@ -1720,7 +1722,6 @@ class Visualizer:
             self.__dataset_config:GetDatasetConfigResponse = dataset_config_to_ros(dataset_config)
             rospy.Service('get_dataset_config', GetDatasetConfig, self.__get_dataset_config)
             self.__local_dataset_twist:Twist = None
-            rospy.Subscriber('cmd_vel', Twist, self.__cmd_vel_callback, queue_size=1)
             movement_fail_times = 0
             movement_fail_times_pub = rospy.Publisher('movement_fail_times', Int32, queue_size=1)
             self.__local_dataset_state = self.LocalDatasetState.INITIALIZED

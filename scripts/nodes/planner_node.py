@@ -7,6 +7,8 @@ sys.path.append(PACKAGE_PATH)
 sys.path.append(SRC_PATH)
 import argparse
 import threading
+if not hasattr(threading.Thread, 'isAlive'):
+    threading.Thread.isAlive = threading.Thread.is_alive
 import json
 from typing import Dict, Tuple, Union, List
 from copy import deepcopy
@@ -107,6 +109,10 @@ class PlannerNode:
         
         self.__global_state = None
         self.__global_state_condition = threading.Condition()
+        self.__cmd_vel_pub = rospy.Publisher('cmd_vel', Twist, queue_size=1)
+        self.__trigger_update_voronoi_graph_pub = rospy.Publisher('update_voronoi_graph_vis', Bool, queue_size=1)
+        self.__trigger_update_high_connectivity_nodes_pub = rospy.Publisher('update_high_connectivity_nodes_vis', Bool, queue_size=1)
+        self.__trigger_update_global_visibility_map_pub = rospy.Publisher('update_global_visibility_map_vis', Int32, queue_size=1)
         rospy.Service('set_planner_state', SetPlannerState, self.__set_planner_state)
         rospy.Service('get_voronoi_graph', GetVoronoiGraph, self.__get_voronoi_graph_callback)
         rospy.Service('get_navigation_path', GetNavPath, self.__get_navigation_path_callback)
@@ -146,10 +152,6 @@ class PlannerNode:
             target=self.__update_map_cv2,
             daemon=True).start()
         
-        self.__cmd_vel_pub = rospy.Publisher('cmd_vel', Twist, queue_size=1)
-        self.__trigger_update_voronoi_graph_pub = rospy.Publisher('update_voronoi_graph_vis', Bool, queue_size=1)
-        self.__trigger_update_high_connectivity_nodes_pub = rospy.Publisher('update_high_connectivity_nodes_vis', Bool, queue_size=1)
-        self.__trigger_update_global_visibility_map_pub = rospy.Publisher('update_global_visibility_map_vis', Int32, queue_size=1)
         self.__fail_vertices_nodes_index = []
         
         while not rospy.is_shutdown() and self.__global_state != GlobalState.QUIT:
@@ -178,7 +180,8 @@ class PlannerNode:
                     twist_bootstrap_up_down = Twist()
                     self.__rotation_arrived_flag = False
                     for booststrap_turn_index in range(int(np.ceil(360 / self.__dataset_config.agent_turn_angle))):
-                        
+                        if rospy.is_shutdown() or self.__global_state == GlobalState.QUIT:
+                            break
                         pose_c2w_world = self.__pose_last['c2w_world'].copy()
                         self.__publish_cmd_vel(twist_bootstrap)
                         self.__get_topdown()
@@ -188,12 +191,13 @@ class PlannerNode:
                                 pose_c2w_world,
                                 self.__pose_last['c2w_world'],
                                 self.__pose_update_translation_threshold,
-                                self.__pose_update_rotation_threshold) == PoseChangeType.NONE and self.__global_state != GlobalState.QUIT:
+                                self.__pose_update_rotation_threshold) == PoseChangeType.NONE and self.__global_state != GlobalState.QUIT and not rospy.is_shutdown():
                             self.__publish_cmd_vel(twist_bootstrap)
                             self.__get_topdown()
                             with self.__update_map_cv2_condition:
                                 self.__update_map_cv2_condition.notify_all()
-                                
+                        if rospy.is_shutdown() or self.__global_state == GlobalState.QUIT:
+                            break
                         pose_c2w_world = self.__pose_last['c2w_world'].copy()
                         updown_times = 3
                         twist_bootstrap_up_down.angular.y = -1 if (((2*updown_times-1-booststrap_turn_index % (2*updown_times) * 2)) < 0) else 1
@@ -205,13 +209,13 @@ class PlannerNode:
                                 pose_c2w_world,
                                 self.__pose_last['c2w_world'],
                                 self.__pose_update_translation_threshold,
-                                self.__pose_update_rotation_threshold) == PoseChangeType.NONE and self.__global_state != GlobalState.QUIT:
+                                self.__pose_update_rotation_threshold) == PoseChangeType.NONE and self.__global_state != GlobalState.QUIT and not rospy.is_shutdown():
                             self.__publish_cmd_vel(twist_bootstrap_up_down)
                             self.__get_topdown()
                             with self.__update_map_cv2_condition:
                                 self.__update_map_cv2_condition.notify_all()
                     booststrap_turn_index += 1
-                    if booststrap_turn_index % 2 == 1:
+                    if booststrap_turn_index % 2 == 1 and not rospy.is_shutdown() and self.__global_state != GlobalState.QUIT:
                         pose_c2w_world = self.__pose_last['c2w_world'].copy()
                         twist_bootstrap_up_down.angular.y = -1
                         self.__publish_cmd_vel(twist_bootstrap_up_down)
@@ -222,11 +226,13 @@ class PlannerNode:
                                 pose_c2w_world,
                                 self.__pose_last['c2w_world'],
                                 self.__pose_update_translation_threshold,
-                                self.__pose_update_rotation_threshold) == PoseChangeType.NONE and self.__global_state != GlobalState.QUIT:
+                                self.__pose_update_rotation_threshold) == PoseChangeType.NONE and self.__global_state != GlobalState.QUIT and not rospy.is_shutdown():
                             self.__publish_cmd_vel(twist_bootstrap_up_down)
                             self.__get_topdown()
                             with self.__update_map_cv2_condition:
                                 self.__update_map_cv2_condition.notify_all()
+                    if rospy.is_shutdown() or self.__global_state == GlobalState.QUIT:
+                        break
                     set_mapper_request.kf_every = kf_every_old
                     set_mapper_request.map_every = map_every_old
                     try:
@@ -1646,6 +1652,8 @@ class PlannerNode:
     
     def __publish_cmd_vel(self, twist:Twist) -> None:
         self.__last_twist = twist
+        while self.__cmd_vel_pub.get_num_connections() == 0 and not rospy.is_shutdown() and self.__global_state != GlobalState.QUIT:
+            rospy.sleep(0.05)
         self.__cmd_vel_pub.publish(twist)
         return
     

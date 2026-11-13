@@ -60,7 +60,10 @@ def get_scene_mesh_url(dataset_format:DatasetFormats, dataset_root_url:str, scen
     elif dataset_format == DatasetFormats.GIBSON:
         habitat_mesh_url = scene_mesh_url = os.path.join(dataset_root_url, f'{scene_id}.glb')
     elif dataset_format == DatasetFormats.REPLICA:
-        habitat_mesh_url = scene_mesh_url = os.path.join(dataset_root_url, scene_id, 'mesh.ply')
+        # habitat_mesh_url = scene_mesh_url = os.path.join(dataset_root_url, scene_id, 'mesh.ply')
+        # habitat_mesh_url = scene_mesh_url = os.path.join(dataset_root_url, scene_id, 'stage.ply')
+        habitat_mesh_url = os.path.join(dataset_root_url, scene_id, 'stage_habitat.ply')
+        scene_mesh_url = os.path.join(dataset_root_url, scene_id, 'stage.ply')
     else:
         raise NotImplementedError(f"Dataset format: {dataset_format.name} not implemented")
     return habitat_mesh_url, scene_mesh_url

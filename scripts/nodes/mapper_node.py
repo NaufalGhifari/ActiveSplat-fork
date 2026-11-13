@@ -7,6 +7,9 @@ sys.path.append(PACKAGE_PATH)
 sys.path.append(SRC_PATH)
 import json
 import argparse
+import threading
+if not hasattr(threading.Thread, 'isAlive'):
+    threading.Thread.isAlive = threading.Thread.is_alive
 from typing import Union
 
 import faulthandler
