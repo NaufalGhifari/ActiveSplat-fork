@@ -216,3 +216,26 @@ m.export('/datasets/replica/room_0/stage_habitat.ply')"
 ```
 
 Also copy /datasets/replica/room_0/mesh.navmesh to /datasets/replica/room_0/stage_habitat.navmesh so Habitat-Sim automatically loads the navmesh for stage_habitat.ply.
+
+
+
+
+---
+# Running
+1. On host shell, grant local Docker containers permission to connect to X11 display: ```xhost +local:docker```
+
+2. Start Docker container: ```docker start activesplat_dev```
+
+3. Connect to bash shell: ```docker exec -it activesplat_dev bash```
+
+4. Run command in container shell:
+```
+export ROS_IP=127.0.0.1 && \
+export ROS_MASTER_URI=http://127.0.0.1:11311 && \
+export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6:/lib/x86_64-linux-gnu/libffi.so.7 && \
+export LIBGL_ALWAYS_SOFTWARE=1 && \
+cd /root/Workspace/activesplat_ws/src/ActiveSplat && \
+roslaunch activesplat habitat.launch \
+  config:=/root/Workspace/activesplat_ws/src/ActiveSplat/config/datasets/replica.json \
+  scene_id:=room_0 save_runtime_data:=1
+```
