@@ -1,4 +1,6 @@
 import os
+import json
+import resource
 from queue import Queue
 from dataclasses import dataclass
 from typing import Dict, List, Union, Tuple
@@ -130,6 +132,13 @@ class SplaTAM:
         self.mapping_frame_time_sum = 0
         self.mapping_frame_time_count = 0
         self.params = None
+        self.start_wallclock_time = time.perf_counter()
+        self.initial_gaussians_count = 0
+        self.peak_gaussians_count = 0
+        self.densification_events_count = 0
+        self.step_history = []
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(self.__device)
         self.config['data']['desired_image_width'] = int(self.__rgbd_sensor.width)
         self.config['data']['desired_image_height'] = int(self.__rgbd_sensor.height)
         self.config['data']['densification_image_width'] = int(self.__rgbd_sensor_render.width / self.__densify_downscale_factor)
@@ -384,6 +393,8 @@ class SplaTAM:
                                                         mean_sq_dist_method=self.config['mean_sq_dist_method'])
             self.params, self.variables = initialize_params(init_pt_cld, self.__step_num, mean3_sq_dist, self.config['gaussian_distribution'])
             self.variables['scene_radius'] = torch.max(densify_depth)/self.config['scene_radius_depth_ratio']
+            self.initial_gaussians_count = int(self.params['means3D'].shape[0])
+            self.peak_gaussians_count = self.initial_gaussians_count
         
         # Initialize Mapping & Tracking for current frame
         iter_time_idx = cur_frame_id
@@ -415,6 +426,7 @@ class SplaTAM:
                 self.params, self.variables = add_new_gaussians(self.params, self.variables, densify_curr_data, 
                                                     self.config['mapping']['sil_thres'], cur_frame_id,
                                                     self.config['mean_sq_dist_method'], self.config['gaussian_distribution'])
+                self.densification_events_count += 1
             
             with torch.no_grad():
                 # Get the current estimated rotation & translation
@@ -529,6 +541,21 @@ class SplaTAM:
             save_params_ckpt(self.params, ckpt_output_dir, cur_frame_id)
             np.save(os.path.join(ckpt_output_dir, f"keyframe_time_indices{cur_frame_id}.npy"), np.array(self.keyframe_time_indices))
 
+        curr_gaussians_count = int(self.params['means3D'].shape[0])
+        if curr_gaussians_count > self.peak_gaussians_count:
+            self.peak_gaussians_count = curr_gaussians_count
+        if cur_frame_id == 0 or (cur_frame_id + 1) % 25 == 0 or cur_frame_id == self.__step_num - 1:
+            vram_alloc_mb = round(torch.cuda.memory_allocated(self.__device) / (1024 ** 2), 2) if torch.cuda.is_available() else 0.0
+            vram_res_mb = round(torch.cuda.memory_reserved(self.__device) / (1024 ** 2), 2) if torch.cuda.is_available() else 0.0
+            self.step_history.append({
+                "frame_id": int(cur_frame_id),
+                "elapsed_s": round(time.perf_counter() - self.start_wallclock_time, 3),
+                "num_gaussians": curr_gaussians_count,
+                "num_keyframes": len(self.keyframe_list),
+                "vram_allocated_mb": vram_alloc_mb,
+                "vram_reserved_mb": vram_res_mb,
+            })
+
         torch.cuda.empty_cache()
         cur_frame_id += 1
         cur_frame_id = cur_frame_id
@@ -541,8 +568,37 @@ class SplaTAM:
                     block=False,
                 )
         
-    def post_processing(self):
+    @staticmethod
+    def _summarize_times_ms(times_ms:List[float], total_wallclock_s:float) -> Dict[str, float]:
+        if not times_ms:
+            return {
+                "count": 0,
+                "total_s": 0.0,
+                "pct_of_wallclock": 0.0,
+                "mean_ms": 0.0,
+                "std_ms": 0.0,
+                "median_ms": 0.0,
+                "p95_ms": 0.0,
+                "max_ms": 0.0,
+            }
+        arr = np.asarray(times_ms, dtype=np.float64)
+        total_s = float(np.sum(arr) / 1000.0)
+        return {
+            "count": int(arr.size),
+            "total_s": round(total_s, 3),
+            "pct_of_wallclock": round((total_s / max(1e-6, total_wallclock_s)) * 100.0, 2),
+            "mean_ms": round(float(np.mean(arr)), 2),
+            "std_ms": round(float(np.std(arr)), 2),
+            "median_ms": round(float(np.median(arr)), 2),
+            "p95_ms": round(float(np.percentile(arr, 95)), 2),
+            "max_ms": round(float(np.max(arr)), 2),
+        }
+
+    def post_processing(self, visualizer_metrics:Dict=None):
+        total_wallclock_s = time.perf_counter() - self.start_wallclock_time
         # Compute Average Runtimes
+        actual_iter_count = self.mapping_iter_time_count
+        actual_mapping_frames = self.mapping_frame_time_count
         if self.mapping_iter_time_count == 0:
             self.mapping_iter_time_count = 1
             self.mapping_frame_time_count = 1
@@ -576,6 +632,106 @@ class SplaTAM:
             save_keyframes(self.keyframe_list, self.keyframes_dir, self.__rgbd_sensor)
         shutil.copy(self.splatam_cfg_url, os.path.join(self.save_path, "config.py"))
         print("Saved SplaTAM results to: ", self.save_path)
+
+        # Compute trajectory length (m) from ground-truth camera poses
+        trajectory_length_m = 0.0
+        if actual_frame_count > 1:
+            gt_c2w_all = np.linalg.inv(self.params['gt_w2c_all_frames'])
+            cam_positions = gt_c2w_all[:, :3, 3]
+            trajectory_length_m = float(np.sum(np.linalg.norm(np.diff(cam_positions, axis=0), axis=1)))
+
+        final_gaussians_count = int(self.params['means3D'].shape[0])
+        self.peak_gaussians_count = max(self.peak_gaussians_count, final_gaussians_count)
+        params_npz_path = self.save_path.joinpath("params.npz")
+        params_npz_size_mb = round(os.path.getsize(params_npz_path) / (1024 ** 2), 2) if params_npz_path.exists() else 0.0
+
+        # GPU VRAM & Host RAM stats
+        gpu_name = "CPU"
+        gpu_total_vram_mb = 0.0
+        peak_alloc_mb = 0.0
+        peak_reserved_mb = 0.0
+        final_alloc_mb = 0.0
+        final_reserved_mb = 0.0
+        device_used_vram_mb = 0.0
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(self.__device)
+            props = torch.cuda.get_device_properties(self.__device)
+            gpu_total_vram_mb = round(props.total_memory / (1024 ** 2), 2)
+            peak_alloc_mb = round(torch.cuda.max_memory_allocated(self.__device) / (1024 ** 2), 2)
+            peak_reserved_mb = round(torch.cuda.max_memory_reserved(self.__device) / (1024 ** 2), 2)
+            final_alloc_mb = round(torch.cuda.memory_allocated(self.__device) / (1024 ** 2), 2)
+            final_reserved_mb = round(torch.cuda.memory_reserved(self.__device) / (1024 ** 2), 2)
+            try:
+                free_b, total_b = torch.cuda.mem_get_info(self.__device)
+                device_used_vram_mb = round((total_b - free_b) / (1024 ** 2), 2)
+            except Exception:
+                pass
+        host_peak_rss_mb = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 2)
+
+        vis = visualizer_metrics or {}
+        completed_steps = int(vis.get("completed_steps", actual_frame_count))
+        minutes, seconds = divmod(total_wallclock_s, 60)
+
+        compute_metrics = {
+            "run_info": {
+                "scene_id": vis.get("scene_id", "unknown"),
+                "mapper_type": str(self.get_mapper_type().value),
+                "configured_step_num": int(self.__step_num),
+                "completed_steps": completed_steps,
+                "mapped_frames_count": int(actual_frame_count),
+                "keyframes_count": len(self.keyframe_list),
+                "densification_events_count": int(self.densification_events_count),
+                "total_mapping_iterations": int(actual_iter_count),
+                "trajectory_path_length_m": round(trajectory_length_m, 3),
+            },
+            "runtime": {
+                "total_wallclock_time_s": round(total_wallclock_s, 3),
+                "total_wallclock_time_formatted": f"{int(minutes)}m {seconds:.2f}s",
+                "effective_steps_per_sec": round(completed_steps / max(1e-6, total_wallclock_s), 3),
+                "effective_mapped_fps": round(actual_frame_count / max(1e-6, total_wallclock_s), 3),
+                "avg_step_wallclock_ms": round((total_wallclock_s * 1000.0) / max(1, completed_steps), 2),
+                "avg_mapping_iter_time_ms": round(mapping_iter_time_avg * 1000.0, 2),
+                "avg_mapping_frame_time_ms": round(mapping_frame_time_avg * 1000.0, 2),
+                "total_splatam_optim_time_s": round(float(self.mapping_frame_time_sum), 3),
+            },
+            "timing_breakdown_ms": {
+                "mapper_run_active": self._summarize_times_ms(vis.get("mapper_run_ms", []), total_wallclock_s),
+                "topdown_render": self._summarize_times_ms(vis.get("topdown_render_ms", []), total_wallclock_s),
+                "global_visibility_query": self._summarize_times_ms(vis.get("global_visibility_ms", []), total_wallclock_s),
+                "local_visibility_query": self._summarize_times_ms(vis.get("local_visibility_ms", []), total_wallclock_s),
+                "rgbd_novel_view_render": self._summarize_times_ms(vis.get("rgbd_render_ms", []), total_wallclock_s),
+            },
+            "memory": {
+                "gpu_name": gpu_name,
+                "gpu_total_vram_mb": gpu_total_vram_mb,
+                "pytorch_peak_allocated_vram_mb": peak_alloc_mb,
+                "pytorch_peak_reserved_vram_mb": peak_reserved_mb,
+                "pytorch_final_allocated_vram_mb": final_alloc_mb,
+                "pytorch_final_reserved_vram_mb": final_reserved_mb,
+                "device_used_vram_at_end_mb": device_used_vram_mb,
+                "host_peak_rss_ram_mb": host_peak_rss_mb,
+            },
+            "gaussian_map": {
+                "initial_gaussians_count": int(self.initial_gaussians_count),
+                "final_gaussians_count": final_gaussians_count,
+                "peak_gaussians_count": int(self.peak_gaussians_count),
+                "gaussians_per_mapped_frame": round(final_gaussians_count / max(1, actual_frame_count), 1),
+                "gaussians_per_meter_traveled": round(final_gaussians_count / max(1e-3, trajectory_length_m), 1),
+                "params_npz_size_mb": params_npz_size_mb,
+                "step_history": self.step_history,
+            },
+        }
+
+        metrics_path = self.save_path.parent.joinpath("compute_metrics.json")
+        with open(metrics_path, "w") as f:
+            json.dump(compute_metrics, f, indent=4)
+        Log(
+            f"Saved compute metrics to {metrics_path} | "
+            f"Wallclock: {compute_metrics['runtime']['total_wallclock_time_formatted']} | "
+            f"Gaussians: {final_gaussians_count:,} (peak {self.peak_gaussians_count:,}) | "
+            f"Peak VRAM (alloc/res): {peak_alloc_mb:.1f}/{peak_reserved_mb:.1f} MB",
+            tag="ActiveSplat",
+        )
         
     def get_step_num(self) -> int:
         return int(self.__step_num)

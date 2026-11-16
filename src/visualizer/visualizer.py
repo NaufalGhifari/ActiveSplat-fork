@@ -876,8 +876,13 @@ class Visualizer:
         self.voronoi_3d_vertices_color = []
         self.whole_navigation_path = None
         self.__rgb_opacity_images = {}
+        mapper_run_ms_list = []
+        topdown_render_ms_list = []
+        global_visibility_ms_list = []
+        local_visibility_ms_list = []
+        rgbd_render_ms_list = []
         
-        while self.__global_state != GlobalState.QUIT:
+        while self.__global_state != GlobalState.QUIT and not rospy.is_shutdown():
             if self.__global_state in [GlobalState.REPLAY, GlobalState.AUTO_PLANNING, GlobalState.MANUAL_PLANNING, GlobalState.MANUAL_CONTROL]:
                 # NOTE: Get observation
                 if self.__frames_cache.empty() and (frame_id is not None):
@@ -914,7 +919,10 @@ class Visualizer:
                     self.__high_loss_samples_pose_pub.publish(pose)
             else:
                 mapper_state = MapperState.IDLE
-            Log(f'Mapper run used {end_timing(*timing_mapper_run):.2f} ms')
+            mapper_run_elapsed_ms = end_timing(*timing_mapper_run)
+            if frame_current is not None:
+                mapper_run_ms_list.append(mapper_run_elapsed_ms)
+            Log(f'Mapper run used {mapper_run_elapsed_ms:.2f} ms')
                 
             if self.__save_runtime_data and ((frame_id % 100 == 0 and frame_id > 0)):
                 self.__save_current_data_callback()
@@ -939,7 +947,10 @@ class Visualizer:
                     self.__render_topdown_visible_map = self.__mapper.render_o3d_image(self.__gaussian_for_render, topdown_cam, scale_modifier=0.01)
                     self.__use_gaussian_condition.release()
                 rerender_topdown_flag = True
-            Log(f'Topdown render used {end_timing(*timing_topdown_render):.2f} ms')
+            topdown_render_elapsed_ms = end_timing(*timing_topdown_render)
+            if rerender_topdown_flag:
+                topdown_render_ms_list.append(topdown_render_elapsed_ms)
+            Log(f'Topdown render used {topdown_render_elapsed_ms:.2f} ms')
             # NOTE: Update topdown map
             if (self.__get_topdown_flag in [self.QueryTopdownFlag.ARRIVED, self.QueryTopdownFlag.RUNNING]) or \
                 rerender_topdown_flag == True:
@@ -1000,7 +1011,9 @@ class Visualizer:
                                 cv2.imwrite(os.path.join(current_vis_data_dir, f'{cur_id}.png'), rgb_opacity_vis)
                             self.__rgb_opacity_images[cur_id] = cv2.cvtColor(rgb_opacity_vis,cv2.COLOR_RGB2BGR)
                             
-                    Log(f'Get global visibility used {end_timing(*timing_get_visibility):.2f} ms', tag='ActiveSplat')
+                    global_vis_elapsed_ms = end_timing(*timing_get_visibility)
+                    global_visibility_ms_list.append(global_vis_elapsed_ms)
+                    Log(f'Get global visibility used {global_vis_elapsed_ms:.2f} ms', tag='ActiveSplat')
                         
                 elif self.__get_visibility_flag == self.QueryVisibilityFlag.LOCAL:
                     # NOTE: Local visibility
@@ -1018,7 +1031,9 @@ class Visualizer:
                         pose_data_o3d = OPENCV_TO_OPENGL @ self.local_node['best_pose']
                         self.rotation_frustum = self.update_target_frustums([pose_data_o3d], ROTATION_FRUSTUM['color'])
                         rerender_rotation_frustum_flag = True
-                    Log(f'Get local visibility used {end_timing(*timing_get_visibility):.2f} ms', tag='ActiveSplat')
+                    local_vis_elapsed_ms = end_timing(*timing_get_visibility)
+                    local_visibility_ms_list.append(local_vis_elapsed_ms)
+                    Log(f'Get local visibility used {local_vis_elapsed_ms:.2f} ms', tag='ActiveSplat')
                     
                 if (self.__get_visibility_flag == self.QueryVisibilityFlag.RUNNING) or\
                     (self.__get_visibility_flag == self.QueryVisibilityFlag.GLOBAL) or\
@@ -1043,7 +1058,11 @@ class Visualizer:
             # NOTE: Show Voronoi 3D
             cmap = plt.get_cmap('YlOrBr')
             if not self.__hide_windows and self.__trigger_update_voronoi_graph_flag and height != 0:
-                voronoi_graph_response:GetVoronoiGraphResponse = self.__get_voronoi_graph_service(GetVoronoiGraphRequest())
+                try:
+                    voronoi_graph_response:GetVoronoiGraphResponse = self.__get_voronoi_graph_service(GetVoronoiGraphRequest())
+                except rospy.ServiceException:
+                    self.__global_state = GlobalState.QUIT
+                    break
                 nodes_position_3d = np.array(voronoi_graph_response.nodes_position_3d).reshape(-1, 3)
                 voronoi_graph_3d_lines = np.array(voronoi_graph_response.voronoi_graph_3d_lines).reshape(-1, 2)
                 voronoi_graph_3d_points = np.array(voronoi_graph_response.voronoi_graph_3d_points).reshape(-1, 3)
@@ -1127,7 +1146,11 @@ class Visualizer:
             rerender_whole_navigation_path_flag = False
             self.whole_navigation_traj = None
             if not self.__hide_windows and self.__global_state in [GlobalState.REPLAY, GlobalState.AUTO_PLANNING, GlobalState.MANUAL_PLANNING, GlobalState.MANUAL_CONTROL]:
-                navigation_path_response:GetNavPathResponse = self.__get_navigation_path_service(GetNavPathRequest())
+                try:
+                    navigation_path_response:GetNavPathResponse = self.__get_navigation_path_service(GetNavPathRequest())
+                except rospy.ServiceException:
+                    self.__global_state = GlobalState.QUIT
+                    break
                 self.whole_navigation_path = np.array(navigation_path_response.whole_navigation_path).reshape(-1,3)
                 if len(self.whole_navigation_path) > 1 and frame_id % 1 == 0:
                     if len(self.whole_navigation_path) > 0:
@@ -1149,7 +1172,9 @@ class Visualizer:
             if not self.__hide_windows or self.__save_runtime_data:
                 if (frame_last_received is not None and\
                     frame_id > rendering_rgbd_last_frame_id):
+                    timing_rgbd_render = start_timing()
                     color_vis, depth_vis = self.__mapper.render_rgbd(frame_last_received, scale_modifier=1.0)
+                    rgbd_render_ms_list.append(end_timing(*timing_rgbd_render))
                     rgbd = np.hstack((color_vis, depth_vis))
                     if self.__save_runtime_data:
                         cv2.imwrite(str(self.render_rgbd_dir) + f'/{frame_id}.png', cv2.cvtColor(rgbd, cv2.COLOR_BGR2RGB))
@@ -1181,7 +1206,21 @@ class Visualizer:
         with open(self.__mapper.save_path.joinpath("transforms.json"), "w") as f:
             f.write(manifest_json)
         self.traing_finished = True
-        self.__mapper.post_processing()
+        completed_steps = 0
+        if self.__local_dataset is not None:
+            completed_steps, _ = self.__local_dataset.get_step_info()
+        elif frame_id is not None:
+            completed_steps = frame_id + 1
+        visualizer_metrics = {
+            "scene_id": self.scene_id,
+            "completed_steps": completed_steps,
+            "mapper_run_ms": mapper_run_ms_list,
+            "topdown_render_ms": topdown_render_ms_list,
+            "global_visibility_ms": global_visibility_ms_list,
+            "local_visibility_ms": local_visibility_ms_list,
+            "rgbd_render_ms": rgbd_render_ms_list,
+        }
+        self.__mapper.post_processing(visualizer_metrics=visualizer_metrics)
         Log('Saving scene data finished')
         
         if os.path.exists(self.__dataset_config.scene_mesh_url):
@@ -1190,7 +1229,10 @@ class Visualizer:
                     'mesh_url': self.__dataset_config.scene_mesh_url,
                     'mesh_transform': self.__scene_mesh_transform.tolist()}
                 json.dump(gt_mesh_config, f, indent=4)
-        set_planner_state_response:SetPlannerStateResponse = self.__set_planner_state_service(SetPlannerStateRequest(GlobalState.QUIT.value))
+        try:
+            set_planner_state_response:SetPlannerStateResponse = self.__set_planner_state_service(SetPlannerStateRequest(GlobalState.QUIT.value))
+        except rospy.ServiceException:
+            pass
         self.__close_all()
 
     def __update_ui_mapper(self,
