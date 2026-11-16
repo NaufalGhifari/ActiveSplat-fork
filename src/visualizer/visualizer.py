@@ -1722,6 +1722,12 @@ class Visualizer:
             self.__get_opacity_service.shutdown()
         with self.__get_opacity_condition:
             self.__get_opacity_condition.notify_all()
+        self.__o3d_const_camera_intrinsics_o3c = None
+        self.__o3d_pcd['current_pcd'] = None
+        try:
+            o3d.core.cuda.release_cache()
+        except Exception:
+            pass
         if self.__hide_windows:
             rospy.signal_shutdown('Quit')
         else:

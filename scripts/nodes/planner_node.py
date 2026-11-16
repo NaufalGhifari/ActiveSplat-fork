@@ -506,7 +506,8 @@ class PlannerNode:
                         try:
                             get_opacity_response:GetOpacityResponse = self.__get_opacity_service(GetOpacityRequest(self.__rotation_arrived_flag, [], []))
                         except rospy.ServiceException as e:
-                            rospy.logerr(f'Get local opacity service call failed: {e}')
+                            if self.__global_state != GlobalState.QUIT and not rospy.is_shutdown():
+                                rospy.logerr(f'Get local opacity service call failed: {e}')
                             self.__global_state = GlobalState.QUIT
                             with self.__global_state_condition:
                                 self.__global_state_condition.notify()
@@ -1030,7 +1031,8 @@ class PlannerNode:
         try:
             get_topdown_response:GetTopdownResponse = self.__get_topdown_service(GetTopdownRequest(self.__rotation_arrived_flag))
         except rospy.ServiceException as e:
-            rospy.logerr(f'Get topdown service call failed: {e}')
+            if self.__global_state != GlobalState.QUIT and not rospy.is_shutdown():
+                rospy.logerr(f'Get topdown service call failed: {e}')
             self.__global_state = GlobalState.QUIT
             with self.__global_state_condition:
                 self.__global_state_condition.notify_all()
@@ -1117,7 +1119,8 @@ class PlannerNode:
                 try:
                     get_opacity_response:GetOpacityResponse = self.__get_opacity_service(GetOpacityRequest(self.__rotation_arrived_flag, node_vertex_c2w_worlds, nodes_id))
                 except rospy.ServiceException as e:
-                    rospy.logerr(f'Get global opacity service call failed: {e}')
+                    if self.__global_state != GlobalState.QUIT and not rospy.is_shutdown():
+                        rospy.logerr(f'Get global opacity service call failed: {e}')
                     self.__global_state = GlobalState.QUIT
                     with self.__global_state_condition:
                         self.__global_state_condition.notify()
