@@ -644,6 +644,8 @@ class SplaTAM:
         self.peak_gaussians_count = max(self.peak_gaussians_count, final_gaussians_count)
         params_npz_path = self.save_path.joinpath("params.npz")
         params_npz_size_mb = round(os.path.getsize(params_npz_path) / (1024 ** 2), 2) if params_npz_path.exists() else 0.0
+        ply_path = self.save_path.joinpath("point_cloud.ply")
+        ply_size_mb = round(os.path.getsize(ply_path) / (1024 ** 2), 2) if ply_path.exists() else 0.0
 
         # GPU VRAM & Host RAM stats
         gpu_name = "CPU"
@@ -718,6 +720,7 @@ class SplaTAM:
                 "gaussians_per_mapped_frame": round(final_gaussians_count / max(1, actual_frame_count), 1),
                 "gaussians_per_meter_traveled": round(final_gaussians_count / max(1e-3, trajectory_length_m), 1),
                 "params_npz_size_mb": params_npz_size_mb,
+                "point_cloud_ply_size_mb": ply_size_mb,
                 "step_history": self.step_history,
             },
         }
