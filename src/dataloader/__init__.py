@@ -1,5 +1,8 @@
 import os
 import re
+import json
+import struct
+import shutil
 from typing import Tuple, Union
 from enum import Enum
 import cv2
@@ -52,6 +55,116 @@ def convert_to_c2w_opencv(c2w:np.ndarray, pose_data_type:PoseDataType) -> np.nda
         c2w = np.linalg.inv(c2w)
     return c2w
     
+def _ensure_replica_stage_habitat(scene_dir:str) -> Tuple[str, str]:
+    """Ensure stage_habitat.glb and stage_habitat.navmesh exist for a Replica scene.
+    Supports both raw Replica scenes (mesh.ply + habitat/mesh_semantic.navmesh)
+    and preprocessed scenes (stage.ply + mesh.navmesh).
+    """
+    stage_ply = os.path.join(scene_dir, 'stage.ply')
+    mesh_ply = os.path.join(scene_dir, 'mesh.ply')
+    scene_mesh_url = stage_ply if os.path.exists(stage_ply) else mesh_ply
+
+    habitat_mesh_url = os.path.join(scene_dir, 'stage_habitat.glb')
+    if not os.path.exists(habitat_mesh_url) and os.path.exists(scene_mesh_url):
+        msg = f"stage_habitat.glb not found in {scene_dir}, generating a new one from {os.path.basename(scene_mesh_url)}..."
+        print(f"[ActiveSplat] {msg}")
+        rospy.loginfo(msg)
+        m = trimesh.load(scene_mesh_url)
+        if isinstance(m, trimesh.Scene):
+            m = m.dump(concatenate=True)
+        verts = np.asarray(m.vertices, dtype=np.float32)
+        faces = np.asarray(m.faces, dtype=np.uint32)
+        mesh_visual = m.visual
+        if isinstance(mesh_visual, visual.TextureVisuals):
+            mesh_visual = mesh_visual.to_color()
+        colors = np.asarray(mesh_visual.vertex_colors, dtype=np.uint8)
+        if colors.shape[1] == 3:
+            colors = np.hstack([colors, np.full((len(colors), 1), 255, dtype=np.uint8)])
+
+        v_bin, c_bin, f_bin = verts.tobytes(), colors.tobytes(), faces.tobytes()
+        pad = lambda b: b + b'\x00' * ((4 - len(b) % 4) % 4)
+        v_bin, c_bin, f_bin = pad(v_bin), pad(c_bin), pad(f_bin)
+        blob = v_bin + c_bin + f_bin
+
+        gltf = {
+            'asset': {'version': '2.0'},
+            'scene': 0,
+            'scenes': [{'nodes': [0]}],
+            'nodes': [{'mesh': 0}],
+            'materials': [{
+                'pbrMetallicRoughness': {
+                    'baseColorFactor': [1.0, 1.0, 1.0, 1.0],
+                    'metallicFactor': 0.0,
+                    'roughnessFactor': 1.0,
+                }
+            }],
+            'meshes': [{
+                'primitives': [{
+                    'attributes': {'POSITION': 0, 'COLOR_0': 1},
+                    'indices': 2,
+                    'material': 0,
+                    'mode': 4,
+                }]
+            }],
+            'accessors': [
+                {
+                    'bufferView': 0,
+                    'componentType': 5126,
+                    'count': len(verts),
+                    'type': 'VEC3',
+                    'min': verts.min(axis=0).tolist(),
+                    'max': verts.max(axis=0).tolist(),
+                },
+                {
+                    'bufferView': 1,
+                    'componentType': 5121,
+                    'normalized': True,
+                    'count': len(colors),
+                    'type': 'VEC4',
+                },
+                {
+                    'bufferView': 2,
+                    'componentType': 5125,
+                    'count': int(faces.size),
+                    'type': 'SCALAR',
+                },
+            ],
+            'bufferViews': [
+                {'buffer': 0, 'byteOffset': 0, 'byteLength': len(v_bin), 'target': 34962},
+                {'buffer': 0, 'byteOffset': len(v_bin), 'byteLength': len(c_bin), 'target': 34962},
+                {'buffer': 0, 'byteOffset': len(v_bin) + len(c_bin), 'byteLength': len(f_bin), 'target': 34963},
+            ],
+            'buffers': [{'byteLength': len(blob)}],
+        }
+        jb = json.dumps(gltf, separators=(',', ':')).encode('utf-8')
+        jb += b' ' * ((4 - len(jb) % 4) % 4)
+        total = 12 + 8 + len(jb) + 8 + len(blob)
+        with open(habitat_mesh_url, 'wb') as f:
+            f.write(struct.pack('<III', 0x46546C67, 2, total))
+            f.write(struct.pack('<II', len(jb), 0x4E4F534A) + jb)
+            f.write(struct.pack('<II', len(blob), 0x004E4942) + blob)
+        done_msg = f"Saved {habitat_mesh_url} ({len(verts)} vertices, {len(faces)} triangles)."
+        print(f"[ActiveSplat] {done_msg}")
+        rospy.loginfo(done_msg)
+
+    target_navmesh = os.path.join(scene_dir, 'stage_habitat.navmesh')
+    if not os.path.exists(target_navmesh):
+        navmesh_candidates = [
+            os.path.join(scene_dir, 'mesh.navmesh'),
+            os.path.join(scene_dir, 'habitat', 'mesh_semantic.navmesh'),
+            os.path.join(scene_dir, 'habitat', 'mesh_preseg_semantic.navmesh'),
+        ]
+        for candidate in navmesh_candidates:
+            if os.path.exists(candidate):
+                nav_msg = f"stage_habitat.navmesh not found in {scene_dir}, copying from {candidate}..."
+                print(f"[ActiveSplat] {nav_msg}")
+                rospy.loginfo(nav_msg)
+                shutil.copyfile(candidate, target_navmesh)
+                break
+
+    return habitat_mesh_url, scene_mesh_url
+
+
 def get_scene_mesh_url(dataset_format:DatasetFormats, dataset_root_url:str, scene_id:str) -> Tuple[Union[str, None], Union[str, None]]:
     assert dataset_format in DatasetFormats, f"Invalid dataset format: {dataset_format.name}"
     if dataset_format == DatasetFormats.MP3D:
@@ -60,12 +173,8 @@ def get_scene_mesh_url(dataset_format:DatasetFormats, dataset_root_url:str, scen
     elif dataset_format == DatasetFormats.GIBSON:
         habitat_mesh_url = scene_mesh_url = os.path.join(dataset_root_url, f'{scene_id}.glb')
     elif dataset_format == DatasetFormats.REPLICA:
-        # habitat_mesh_url = scene_mesh_url = os.path.join(dataset_root_url, scene_id, 'mesh.ply')
-        # habitat_mesh_url = scene_mesh_url = os.path.join(dataset_root_url, scene_id, 'stage.ply')
-        
-        # habitat_mesh_url = os.path.join(dataset_root_url, scene_id, 'stage_habitat.ply')
-        habitat_mesh_url = os.path.join(dataset_root_url, scene_id, 'stage_habitat.glb')
-        scene_mesh_url = os.path.join(dataset_root_url, scene_id, 'stage.ply')
+        scene_dir = os.path.join(dataset_root_url, scene_id)
+        habitat_mesh_url, scene_mesh_url = _ensure_replica_stage_habitat(scene_dir)
     else:
         raise NotImplementedError(f"Dataset format: {dataset_format.name} not implemented")
     return habitat_mesh_url, scene_mesh_url
